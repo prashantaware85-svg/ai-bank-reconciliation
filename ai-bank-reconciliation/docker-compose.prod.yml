@@ -1,0 +1,97 @@
+# AI Bank Reconciliation — PRODUCTION stack.
+# Usage: docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+# Network model: only the frontend is publicly reachable. PostgreSQL and
+# Redis live on the internal network only. The backend is published on
+# 127.0.0.1 for the local Tally Agent / reverse proxy; front it with a
+# reverse proxy (nginx/Caddy/Traefik) for real HTTPS deployments.
+# The Tally Agent itself always runs on the user's Windows PC (outbound
+# HTTPS only) — it is NOT part of this stack.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-bank-postgres-prod
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-bank_reconciliation}
+    # No ports published: internal network only.
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:?POSTGRES_USER is required} -d ${POSTGRES_DB:-bank_reconciliation}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-bank-redis-prod
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    # No ports published: internal network only.
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ai-bank-backend-prod
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DATABASE_URL: postgresql://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-bank_reconciliation}?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      AI_PROVIDER: ${AI_PROVIDER:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-}
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+    # Localhost only: reachable by the on-machine Tally Agent and a local
+    # reverse proxy. Do NOT publish this on a public interface.
+    ports:
+      - "127.0.0.1:3001:3001"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e 'fetch(\"http://127.0.0.1:3001/health/ready\").then(function(r){if(!r.ok)process.exit(1)}).catch(function(){process.exit(1)})'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked into the client bundle at build time: MUST be the public
+        # backend URL (usually https://<host>/api via reverse proxy).
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL is required}
+    container_name: ai-bank-frontend-prod
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres-data:
+  redis-data:

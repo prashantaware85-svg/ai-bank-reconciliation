@@ -1,0 +1,593 @@
+// Prisma schema — AI Bank Reconciliation Tool (Step 2: database architecture).
+// No business logic here. No seed data. PostgreSQL + Prisma 7.
+// Connection URL lives in prisma.config.ts (not in this file).
+
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  // Inside src so `nest build` (rootDir ./src) compiles. See Step 3 report.
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum CompanyRole {
+  OWNER
+  ACCOUNTANT
+  REVIEWER
+  VIEWER
+}
+
+enum ImportStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum TransactionDirection {
+  DEBIT
+  CREDIT
+}
+
+enum TallyConnectionStatus {
+  CONNECTED
+  DISCONNECTED
+  ERROR
+}
+
+enum ReconciliationStatus {
+  MATCHED
+  POSSIBLE_MATCH
+  UNMATCHED
+  AMOUNT_MISMATCH
+  DATE_MISMATCH
+  MISSING_IN_TALLY
+  MISSING_IN_BANK
+  REVIEW_REQUIRED
+}
+
+enum MatchType {
+  ONE_TO_ONE
+  ONE_TO_MANY
+  MANY_TO_ONE
+  DUPLICATE_CANDIDATE
+}
+
+enum LinkSide {
+  BANK
+  TALLY
+}
+
+enum ReviewStatus {
+  PENDING_REVIEW
+  IN_REVIEW
+  CONFIRMED_MATCH
+  WRONG_PARTY
+  DUPLICATE_CONFIRMED
+  AMOUNT_MISMATCH_CONFIRMED
+  DATE_MISMATCH_CONFIRMED
+  MISSING_IN_TALLY_CONFIRMED
+  MISSING_IN_BANK_CONFIRMED
+  REJECTED
+  IGNORED
+  CORRECTION_REQUIRED
+}
+
+enum ReviewActionType {
+  START_REVIEW
+  CONFIRM_MATCH
+  CONFIRM_WRONG_PARTY
+  CONFIRM_DUPLICATE
+  CONFIRM_AMOUNT_MISMATCH
+  CONFIRM_DATE_MISMATCH
+  CONFIRM_MISSING_IN_TALLY
+  CONFIRM_MISSING_IN_BANK
+  REJECT
+  IGNORE
+  REOPEN
+}
+
+enum AiClassification {
+  NO_EXCEPTION
+  WRONG_PARTY_CANDIDATE
+  DUPLICATE_CANDIDATE
+  AMOUNT_ANOMALY
+  DATE_ANOMALY
+  NARRATION_ANOMALY
+  REVIEW_REQUIRED
+}
+
+enum AiRiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum AliasType {
+  BANK_NARRATION
+  TALLY_PARTY
+}
+
+// ---------------------------------------------------------------------------
+// Identity & multi-tenancy
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String
+  email        String   @unique
+  passwordHash String // bcrypt/argon2 hash only — never plain text
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  companyUsers CompanyUser[]
+  auditLogs    AuditLog[]
+
+  // Step 10: party aliases this user approved/created.
+  approvedPartyAliases PartyAlias[] @relation("PartyAliasCreator")
+
+  // Step 10: review decisions made by this user (kept on delete → SetNull).
+  reviewActions ReviewAction[] @relation("ReviewActionUser")
+
+  // Step 3 (auth): server-side refresh-token tracking for rotation + logout.
+  // Only one-way SHA-256 digests are stored — never plain tokens/secrets.
+  refreshTokens RefreshToken[]
+
+  // Step 7: runs started by this user (kept on user delete → SetNull).
+  reconciliationRuns ReconciliationRun[]
+}
+
+model Company {
+  id            String   @id @default(uuid()) @db.Uuid
+  companyName   String
+  legalName     String?
+  gstin         String?  @unique
+  pan           String?
+  financialYear String
+  currency      String   @default("INR")
+  timezone      String   @default("Asia/Kolkata")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  companyUsers       CompanyUser[]
+  bankAccounts       BankAccount[]
+  bankImports        BankImport[]
+  bankTransactions   BankTransaction[]
+  tallyConnections   TallyConnection[]
+  tallyTransactions  TallyTransaction[]
+  tallySyncs         TallySync[]
+  reconciliationRuns ReconciliationRun[]
+  partyAliases       PartyAlias[]
+  auditLogs          AuditLog[]
+  reviewActions      ReviewAction[]
+
+  @@index([companyName])
+}
+
+model CompanyUser {
+  id        String      @id @default(uuid()) @db.Uuid
+  userId    String      @db.Uuid
+  companyId String      @db.Uuid
+  role      CompanyRole @default(VIEWER)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, companyId])
+  @@index([userId])
+  @@index([companyId])
+}
+
+// ---------------------------------------------------------------------------
+// Bank side (statement imports preserve original row data)
+// ---------------------------------------------------------------------------
+
+model BankAccount {
+  id                  String   @id @default(uuid()) @db.Uuid
+  companyId           String   @db.Uuid
+  bankName            String
+  accountName         String
+  accountNumberMasked String // masked only — never store full account numbers
+  ifsc                String?
+  currency            String   @default("INR")
+  isActive            Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  company            Company             @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bankImports        BankImport[]
+  bankTransactions   BankTransaction[]
+  reconciliationRuns ReconciliationRun[]
+
+  @@unique([companyId, accountName])
+  @@index([companyId])
+  @@index([bankName])
+}
+
+model BankImport {
+  id            String       @id @default(uuid()) @db.Uuid
+  companyId     String       @db.Uuid
+  bankAccountId String       @db.Uuid
+  fileName      String
+  fileType      String // e.g. CSV, XLSX — raw label from upload
+  totalRows     Int          @default(0)
+  importedRows  Int          @default(0)
+  skippedRows   Int          @default(0)
+  failedRows    Int          @default(0)
+  status        ImportStatus @default(PENDING)
+  summary       Json? // persisted import summary: warnings, mapping snapshot, totals
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  company      Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bankAccount  BankAccount       @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  transactions BankTransaction[]
+
+  @@index([companyId])
+  @@index([bankAccountId])
+  @@index([status])
+}
+
+model BankTransaction {
+  id                  String               @id @default(uuid()) @db.Uuid
+  companyId           String               @db.Uuid
+  bankAccountId       String               @db.Uuid
+  importId            String               @db.Uuid
+  transactionDate     DateTime
+  valueDate           DateTime?
+  description         String?
+  narration           String?
+  chequeNumber        String?
+  reference           String?
+  debit               Decimal?             @db.Decimal(19, 2)
+  credit              Decimal?             @db.Decimal(19, 2)
+  amount              Decimal              @db.Decimal(19, 2)
+  direction           TransactionDirection
+  balance             Decimal?             @db.Decimal(19, 2)
+  originalRow         Json // JSONB — verbatim source row, never mutated
+  normalizedNarration String?
+  normalizedReference String?
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+
+  company               Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bankAccount           BankAccount                @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  bankImport            BankImport                 @relation(fields: [importId], references: [id], onDelete: Cascade)
+  reconciliationResults ReconciliationResult[]
+  reconciliationLinks   ReconciliationResultLink[]
+
+  @@index([companyId])
+  @@index([bankAccountId])
+  @@index([importId])
+  @@index([transactionDate])
+  @@index([reference])
+  @@index([normalizedReference])
+  @@index([amount])
+  @@index([companyId, transactionDate])
+  @@index([companyId, amount])
+}
+
+// ---------------------------------------------------------------------------
+// Tally side (read-only mirror — no credentials stored)
+// ---------------------------------------------------------------------------
+
+model TallyConnection {
+  id          String                @id @default(uuid()) @db.Uuid
+  companyId   String                @db.Uuid
+  name        String
+  status      TallyConnectionStatus @default(DISCONNECTED)
+  connectorId String? // opaque connector identifier — never a password/secret
+  lastSyncAt  DateTime?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  syncs TallySync[]
+
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@index([status])
+}
+
+// Sync runs track one agent-driven ingestion (Step 6). Status reuses
+// ImportStatus (PENDING → PROCESSING → COMPLETED/FAILED). No credentials.
+
+model TallySync {
+  id              String       @id @default(uuid()) @db.Uuid
+  companyId       String       @db.Uuid
+  connectionId    String       @db.Uuid
+  status          ImportStatus @default(PENDING)
+  tallyCompany    String
+  bankLedger      String
+  fromDate        DateTime?
+  toDate          DateTime?
+  recordsReceived Int          @default(0)
+  recordsImported Int          @default(0)
+  recordsSkipped  Int          @default(0)
+  recordsFailed   Int          @default(0)
+  errorMessage    String?
+  startedAt       DateTime     @default(now())
+  completedAt     DateTime?
+  createdAt       DateTime     @default(now())
+
+  company    Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  connection TallyConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@index([connectionId])
+  @@index([status])
+}
+
+model TallyTransaction {
+  id              String               @id @default(uuid()) @db.Uuid
+  companyId       String               @db.Uuid
+  voucherId       String? // Tally GUID / master id — indexed, not unique (line items repeat)
+  voucherNo       String?
+  date            DateTime
+  ledger          String?
+  bankLedger      String?
+  voucherType     String?
+  direction       TransactionDirection
+  amount          Decimal              @db.Decimal(19, 2)
+  reference       String?
+  narration       String?
+  party           String?
+  normalizedParty String?
+  // Server-computed dedup key: SHA-256 over stable voucher fields.
+  // voucherId-first; falls back to voucherNo/date/ledger/amount when absent.
+  identityHash    String
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  reconciliationResults ReconciliationResult[]
+  reconciliationLinks   ReconciliationResultLink[]
+
+  @@unique([companyId, identityHash])
+  @@index([companyId])
+  @@index([voucherId])
+  @@index([voucherNo])
+  @@index([date])
+  @@index([reference])
+  @@index([normalizedParty])
+  @@index([amount])
+  @@index([companyId, date])
+  @@index([companyId, amount])
+}
+
+// ---------------------------------------------------------------------------
+// Auth (Step 3) — refresh-token tracking for rotation + revocation.
+// Stores ONLY a SHA-256 digest of the refresh JWT (never the token itself,
+// never passwords/secrets). Access tokens stay stateless.
+// ---------------------------------------------------------------------------
+
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique // hex SHA-256 digest of the refresh JWT
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Matching helpers + audit
+// ---------------------------------------------------------------------------
+
+model PartyAlias {
+  id              String    @id @default(uuid()) @db.Uuid
+  companyId       String    @db.Uuid
+  canonicalParty  String
+  alias           String
+  normalizedAlias String
+  isApproved      Boolean   @default(false)
+  approvedBy      String?   @db.Uuid
+  approvedAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  company       Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdByUser User?   @relation("PartyAliasCreator", fields: [approvedBy], references: [id], onDelete: SetNull)
+
+  @@unique([companyId, normalizedAlias])
+  @@index([companyId])
+  @@index([normalizedAlias])
+  @@index([canonicalParty])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  companyId String   @db.Uuid
+  userId    String?  @db.Uuid
+  action    String
+  entity    String
+  entityId  String?
+  oldValue  Json?
+  newValue  Json?
+  createdAt DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user    User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([companyId])
+  @@index([userId])
+  @@index([entity, entityId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation (Step 7) — deterministic, read-only analysis.
+// The engine NEVER edits/deletes Bank or Tally data; it only writes runs
+// and results. Result rows reference transactions without uniqueness, so
+// future 1:N / N:1 strategies can reuse rows (see engine interfaces).
+// ---------------------------------------------------------------------------
+
+model ReconciliationRun {
+  id                     String       @id @default(uuid()) @db.Uuid
+  companyId              String       @db.Uuid
+  bankAccountId          String       @db.Uuid
+  fromDate               DateTime
+  toDate                 DateTime
+  dateToleranceDays      Int          @default(2)
+  status                 ImportStatus @default(PENDING)
+  startedAt              DateTime     @default(now())
+  completedAt            DateTime?
+  totalBankTransactions  Int          @default(0)
+  totalTallyTransactions Int          @default(0)
+  matchedCount           Int          @default(0)
+  possibleMatchCount     Int          @default(0)
+  unmatchedCount         Int          @default(0)
+  exceptionCount         Int          @default(0)
+  createdBy              String?      @db.Uuid
+  config                 Json?
+  createdAt              DateTime     @default(now())
+  updatedAt              DateTime     @updatedAt
+
+  company       Company                @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bankAccount   BankAccount            @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  creator       User?                  @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  results       ReconciliationResult[]
+  reviewActions ReviewAction[]
+
+  @@index([companyId])
+  @@index([bankAccountId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model ReconciliationResult {
+  id                  String               @id @default(uuid()) @db.Uuid
+  reconciliationRunId String               @db.Uuid
+  bankTransactionId   String?              @db.Uuid
+  tallyTransactionId  String?              @db.Uuid
+  matchStatus         ReconciliationStatus
+  // Step 8: split/duplicate results link several transactions via links[].
+  // bankTransactionId/tallyTransactionId keep the 1:1 fast path working.
+  matchType           MatchType            @default(ONE_TO_ONE)
+  bankTotal           Decimal?             @db.Decimal(19, 2)
+  tallyTotal          Decimal?             @db.Decimal(19, 2)
+  confidence          Int?
+  amountDifference    Decimal?             @db.Decimal(19, 2)
+  dateDifferenceDays  Int?
+  matchReason         String?
+  evidence            Json?
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+
+  // Step 10 (review workflow) — separate from matchStatus, never overwrites
+  // the deterministic status. reviewVersion = optimistic concurrency.
+  reviewStatus   ReviewStatus @default(PENDING_REVIEW)
+  reviewVersion  Int          @default(0)
+  lastReviewedBy String?      @db.Uuid
+  lastReviewedAt DateTime?
+
+  run              ReconciliationRun          @relation(fields: [reconciliationRunId], references: [id], onDelete: Cascade)
+  bankTransaction  BankTransaction?           @relation(fields: [bankTransactionId], references: [id], onDelete: Cascade)
+  tallyTransaction TallyTransaction?          @relation(fields: [tallyTransactionId], references: [id], onDelete: Cascade)
+  links            ReconciliationResultLink[]
+  aiAnalyses       AIAnalysis[]
+  reviewActions    ReviewAction[]
+
+  @@index([reconciliationRunId])
+  @@index([bankTransactionId])
+  @@index([tallyTransactionId])
+  @@index([matchStatus])
+  @@index([matchType])
+  @@index([reviewStatus])
+}
+
+// Review workflow history (Step 10). Immutable: rows are never updated or
+// deleted. Each row records one human decision + audit context.
+
+model ReviewAction {
+  id                     String           @id @default(uuid()) @db.Uuid
+  companyId              String           @db.Uuid
+  reconciliationResultId String           @db.Uuid
+  userId                 String?          @db.Uuid
+  action                 ReviewActionType
+  previousStatus         ReviewStatus
+  newStatus              ReviewStatus
+  comment                String?
+  createdAt              DateTime         @default(now())
+
+  company             Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  result              ReconciliationResult @relation(fields: [reconciliationResultId], references: [id], onDelete: Cascade)
+  user                User?                @relation("ReviewActionUser", fields: [userId], references: [id], onDelete: SetNull)
+  reconciliationRun   ReconciliationRun?   @relation(fields: [reconciliationRunId], references: [id])
+  reconciliationRunId String?              @db.Uuid
+
+  @@index([reconciliationResultId])
+  @@index([companyId])
+  @@index([userId])
+  @@index([createdAt])
+}
+
+// Normalized N-side links for split/duplicate results (Step 8).
+// Queryable alternative to ID arrays; single-side links also allow
+// duplicate candidates within one source.
+
+model ReconciliationResultLink {
+  id                     String   @id @default(uuid()) @db.Uuid
+  reconciliationResultId String   @db.Uuid
+  side                   LinkSide
+  bankTransactionId      String?  @db.Uuid
+  tallyTransactionId     String?  @db.Uuid
+  createdAt              DateTime @default(now())
+
+  result           ReconciliationResult @relation(fields: [reconciliationResultId], references: [id], onDelete: Cascade)
+  bankTransaction  BankTransaction?     @relation(fields: [bankTransactionId], references: [id], onDelete: Cascade)
+  tallyTransaction TallyTransaction?    @relation(fields: [tallyTransactionId], references: [id], onDelete: Cascade)
+  aiAnalyses       AIAnalysis[]
+
+  @@index([reconciliationResultId])
+  @@index([bankTransactionId])
+  @@index([tallyTransactionId])
+}
+
+// AI exception analysis (Step 9) — advisory only. AI never modifies
+// accounting data; deterministic results remain the source of truth.
+// Cache key dedups repeat analyses of unchanged results.
+
+model AIAnalysis {
+  id                      String           @id @default(uuid()) @db.Uuid
+  reconciliationResultId  String           @db.Uuid
+  provider                String
+  model                   String
+  promptVersion           String
+  classification          AiClassification
+  aiConfidence            Decimal          @db.Decimal(5, 4)
+  riskLevel               AiRiskLevel
+  reason                  String
+  evidence                Json?
+  recommendedAction       String?
+  inputHash               String // SHA-256 of the sanitized analysis input
+  deterministicConfidence Int? // snapshot; never overwritten by AI
+  createdAt               DateTime         @default(now())
+  updatedAt               DateTime         @updatedAt
+
+  result                     ReconciliationResult      @relation(fields: [reconciliationResultId], references: [id], onDelete: Cascade)
+  reconciliationResultLink   ReconciliationResultLink? @relation(fields: [reconciliationResultLinkId], references: [id])
+  reconciliationResultLinkId String?                   @db.Uuid
+
+  @@unique([reconciliationResultId, promptVersion, model, inputHash])
+  @@index([reconciliationResultId])
+}

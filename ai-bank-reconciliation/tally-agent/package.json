@@ -1,0 +1,22 @@
+{
+  "name": "tally-agent",
+  "version": "0.1.0",
+  "description": "Local Windows agent: reads TallyPrime over HTTP/XML and pushes normalized transactions to the AI Bank Reconciliation backend. Read-only with respect to Tally.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js",
+    "check": "node dist/cli.js check",
+    "lint": "oxlint --type-aware src/ 2>&1 || npx tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.3.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.2"
+  }
+}
